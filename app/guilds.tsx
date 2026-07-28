@@ -1,78 +1,170 @@
-import { View, FlatList, TextInput, TouchableOpacity, Text } from "react-native";
+import {
+  View,
+  FlatList,
+  TextInput,
+  TouchableOpacity,
+  Text,
+  RefreshControl,
+  useColorScheme,
+} from "react-native";
 import { useRouter } from "expo-router";
 import { useWallet } from "../src/features/wallet/useWallet";
+import { useGuilds, type GuildListItem } from "../src/features/guilds/useGuilds";
 import { AppHeader } from "../src/components/AppHeader";
 import { GuildCard } from "../src/components/GuildCard";
-import { LoadingState } from "../src/components/LoadingState";
+import { GuildListSkeleton } from "../src/components/GuildCardSkeleton";
 import { ErrorState } from "../src/components/ErrorState";
 import { EmptyMembershipsState } from "../src/components/EmptyMembershipsState";
 import { EmptyState } from "../src/components/EmptyState";
 import { WalletRequired } from "../src/components/WalletRequired";
 import { useDebouncedValue } from "../src/lib/useDebouncedValue";
-import React, { useState, useMemo } from "react";
-import { useMembership } from "../src/features/membership/useMembership";
+import React, { useState, useMemo, useCallback } from "react";
+import { useMembership, type EnrichedMembership } from "../src/features/membership/useMembership";
 import { StaleDataBanner } from "../src/components/StaleDataBanner";
-import { useStaleQuery } from "../src/features/offline/useStaleQuery";
+import { useCombinedStaleState } from "../src/features/offline/useStaleQuery";
+import { useQueryClient } from "@tanstack/react-query";
+import { queryKeys } from "../src/lib/queryKeys";
 
-type Membership = {
-  id: string;
-  name: string;
+type GuildListRow = {
+  guildId: string;
+  guildName: string;
   isActive: boolean;
   roleCount: number;
+  status?: EnrichedMembership["status"];
 };
+
+function rowsFromWalletGuilds(
+  guilds: GuildListItem[],
+  memberships: EnrichedMembership[],
+): GuildListRow[] {
+  const membershipsByGuildId = new Map(
+    memberships.map((membership) => [membership.guildId, membership]),
+  );
+
+  return guilds.map((guild) => {
+    const membership = membershipsByGuildId.get(guild.id);
+    return {
+      guildId: guild.id,
+      guildName: guild.name,
+      isActive: guild.isActive,
+      roleCount: guild.roleCount ?? membership?.roleCount ?? 0,
+      status: guild.status ?? membership?.status ?? (guild.isActive ? "active" : "inactive"),
+    };
+  });
+}
+
+function rowsFromMemberships(memberships: EnrichedMembership[]): GuildListRow[] {
+  return memberships.map((membership) => ({
+    guildId: membership.guildId,
+    guildName: membership.guildName,
+    isActive: membership.isActive,
+    roleCount: membership.roleCount,
+    status: membership.status,
+  }));
+}
 
 export default function Guilds() {
   const router = useRouter();
+  const colorScheme = useColorScheme();
   const { walletAddress, disconnect } = useWallet();
-  const { useMembershipsQuery } = useMembership(walletAddress);
-  const membershipsQuery = useMembershipsQuery();
-  const { data: memberships, isLoading, error } = membershipsQuery;
-  const staleState = useStaleQuery(membershipsQuery);
+  const { useWalletGuilds } = useGuilds();
+  const { useEnrichedMemberships } = useMembership(walletAddress);
+  const queryClient = useQueryClient();
+
+  const guildsQuery = useWalletGuilds(walletAddress);
+  const membershipsQuery = useEnrichedMemberships();
+  const memberships = membershipsQuery.data ?? [];
+  const staleState = useCombinedStaleState([guildsQuery, membershipsQuery]);
 
   const [searchQuery, setSearchQuery] = useState("");
+  const [isRefetching, setIsRefetching] = useState(false);
   const debouncedQuery = useDebouncedValue(searchQuery, 300);
 
-  const filteredMemberships = useMemo<Membership[]>(() => {
-    if (!memberships) return [];
+  const listRows = useMemo(() => {
+    const guilds = guildsQuery.data ?? [];
+    return guilds.length > 0
+      ? rowsFromWalletGuilds(guilds, memberships)
+      : rowsFromMemberships(memberships);
+  }, [guildsQuery.data, memberships]);
+
+  const filteredGuilds = useMemo(() => {
     const query = debouncedQuery.trim().toLowerCase();
-    if (!query) return memberships;
-    return memberships.filter((m) => m.name.toLowerCase().includes(query));
-  }, [memberships, debouncedQuery]);
+    if (!query) return listRows;
+    return listRows.filter((guild) => guild.guildName.toLowerCase().includes(query));
+  }, [listRows, debouncedQuery]);
 
   const handleConnectDifferentWallet = async () => {
     await disconnect();
     router.replace("/profile");
   };
 
-  if (isLoading) {
+  const handleRefresh = useCallback(async () => {
+    if (!walletAddress) return;
+
+    setIsRefetching(true);
+    try {
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: queryKeys.walletGuilds.byWallet(walletAddress) }),
+        queryClient.invalidateQueries({ queryKey: queryKeys.memberships.byWallet(walletAddress) }),
+        guildsQuery.refetch(),
+        membershipsQuery.refetch(),
+      ]);
+    } finally {
+      setIsRefetching(false);
+    }
+  }, [guildsQuery, membershipsQuery, queryClient, walletAddress]);
+
+  if (!walletAddress) {
     return (
       <WalletRequired>
-        <View className="flex-1 bg-background" testID="guilds-screen">
+        <View className="flex-1 bg-background dark:bg-slate-900" testID="guilds-screen">
           <AppHeader title="My Guilds" showBack />
-          <LoadingState message="Loading memberships..." />
+          <EmptyState
+            title="Connect Wallet"
+            message="Connect a wallet to load your GuildPass guilds."
+          />
         </View>
       </WalletRequired>
     );
   }
 
-  if (error && !memberships) {
+  if (guildsQuery.isLoading && membershipsQuery.isLoading && listRows.length === 0) {
     return (
       <WalletRequired>
-        <View className="flex-1 bg-background" testID="guilds-screen">
+        <View className="flex-1 bg-background dark:bg-slate-900" testID="guilds-screen">
+          <AppHeader title="My Guilds" showBack />
+          <GuildListSkeleton />
+        </View>
+      </WalletRequired>
+    );
+  }
+
+  if (guildsQuery.isError && membershipsQuery.error && listRows.length === 0) {
+    return (
+      <WalletRequired>
+        <View className="flex-1 bg-background dark:bg-slate-900" testID="guilds-screen">
           <AppHeader title="My Guilds" showBack />
           {staleState.isOffline ? (
             <StaleDataBanner reason="offline" lastSyncedAt={staleState.lastSyncedAt} />
           ) : null}
-          <ErrorState message="Failed to load memberships" />
+          <ErrorState
+            message={
+              guildsQuery.error instanceof Error
+                ? guildsQuery.error.message
+                : "Unable to load your guilds."
+            }
+            onRetry={handleRefresh}
+            isRetrying={isRefetching || guildsQuery.isFetching || membershipsQuery.isFetching}
+          />
         </View>
       </WalletRequired>
     );
   }
 
-  if (!memberships || memberships.length === 0) {
+  if (listRows.length === 0) {
     return (
       <WalletRequired>
-        <View className="flex-1 bg-background" testID="guilds-screen">
+        <View className="flex-1 bg-background dark:bg-slate-900" testID="guilds-screen">
           <AppHeader title="My Guilds" showBack />
           {staleState.isOffline ? (
             <StaleDataBanner reason="offline" lastSyncedAt={staleState.lastSyncedAt} />
@@ -83,80 +175,77 @@ export default function Guilds() {
     );
   }
 
+  const staleBanner = staleState.isOffline ? (
+    <StaleDataBanner reason="offline" lastSyncedAt={staleState.lastSyncedAt} />
+  ) : staleState.isStale && staleState.reason ? (
+    <StaleDataBanner reason={staleState.reason} lastSyncedAt={staleState.lastSyncedAt} />
+  ) : null;
+
+  const searchHeader = (
+    <View>
+      {staleBanner}
+      <View className="px-4 pt-2 pb-1">
+        <View className="flex-row items-center bg-white dark:bg-slate-800 rounded-xl px-4 py-3 border border-border dark:border-slate-700">
+          <Text className="text-text-muted dark:text-slate-400 mr-2">🔍</Text>
+          <TextInput
+            className="flex-1 text-text dark:text-slate-100 text-base"
+            placeholder="Search guilds..."
+            placeholderTextColor={colorScheme === "dark" ? "#94a3b8" : "#9ca3af"}
+            value={searchQuery}
+            onChangeText={setSearchQuery}
+            autoCapitalize="none"
+            autoCorrect={false}
+            clearButtonMode="while-editing"
+            testID="guild-search-input"
+            accessibilityLabel="Search guilds by name"
+          />
+          {searchQuery.length > 0 && (
+            <TouchableOpacity
+              onPress={() => setSearchQuery("")}
+              hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
+              testID="guild-search-clear"
+              accessibilityLabel="Clear search"
+            >
+              <Text className="text-text-muted dark:text-slate-400 text-lg ml-2">✕</Text>
+            </TouchableOpacity>
+          )}
+        </View>
+      </View>
+    </View>
+  );
+
+  const isRefreshing = isRefetching || guildsQuery.isRefetching || membershipsQuery.isRefetching;
+  const isShowingOfflineCache = staleState.isOffline && filteredGuilds.length > 0;
+
   return (
     <WalletRequired>
-      <View className="flex-1 bg-background" testID="guilds-screen">
+      <View className="flex-1 bg-background dark:bg-slate-900" testID="guilds-screen">
         <AppHeader title="My Guilds" showBack />
         <FlatList
-          data={memberships}
-          keyExtractor={(item) => item.id}
+          data={filteredGuilds}
+          keyExtractor={(item) => item.guildId}
           contentContainerStyle={{ padding: 16 }}
           testID="guilds-list"
-          ListHeaderComponent={
-            staleState.isOffline ? (
-              <StaleDataBanner reason="offline" lastSyncedAt={staleState.lastSyncedAt} />
-            ) : staleState.isStale && staleState.reason ? (
-              <StaleDataBanner reason={staleState.reason} lastSyncedAt={staleState.lastSyncedAt} />
-            ) : null
-          }
+          ListHeaderComponent={searchHeader}
+          refreshControl={<RefreshControl refreshing={isRefreshing} onRefresh={handleRefresh} />}
           renderItem={({ item }) => (
             <GuildCard
-              name={item.name}
-              id={item.id}
+              name={item.guildName}
+              id={item.guildId}
               isActive={item.isActive}
               roleCount={item.roleCount}
-              onPress={() => router.push(`/guilds/${item.id}`)}
-        {/* Search Input */}
-        <View className="px-4 pt-2 pb-1">
-          <View className="flex-row items-center bg-white rounded-xl px-4 py-3 border border-border">
-            <Text className="text-text-muted mr-2">🔍</Text>
-            <TextInput
-              className="flex-1 text-text text-base"
-              placeholder="Search guilds..."
-              placeholderTextColor="#9CA3AF"
-              value={searchQuery}
-              onChangeText={setSearchQuery}
-              autoCapitalize="none"
-              autoCorrect={false}
-              clearButtonMode="while-editing"
-              testID="guild-search-input"
-              accessibilityLabel="Search guilds by name"
+              status={item.status}
+              offlineCached={isShowingOfflineCache}
+              onPress={() => router.push(`/guilds/${item.guildId}`)}
             />
-            {searchQuery.length > 0 && (
-              <TouchableOpacity
-                onPress={() => setSearchQuery("")}
-                hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
-                testID="guild-search-clear"
-                accessibilityLabel="Clear search"
-              >
-                <Text className="text-text-muted text-lg ml-2">✕</Text>
-              </TouchableOpacity>
-            )}
-          </View>
-        </View>
-        {/* Guild List */}
-        {filteredMemberships.length === 0 ? (
-          <EmptyState
-            title="No Guilds Found"
-            message={`No guilds match "${debouncedQuery}". Try a different search term.`}
-          />
-        ) : (
-          <FlatList
-            data={filteredMemberships}
-            keyExtractor={(item) => item.id}
-            contentContainerStyle={{ padding: 16 }}
-            testID="guilds-list"
-            renderItem={({ item }) => (
-              <GuildCard
-                name={item.name}
-                id={item.id}
-                isActive={item.isActive}
-                roleCount={item.roleCount}
-                onPress={() => router.push(`/guilds/${item.id}`)}
-              />
-            )}
-          />
-        )}
+          )}
+          ListEmptyComponent={
+            <EmptyState
+              title="No Guilds Found"
+              message={`No guilds match "${debouncedQuery}". Try a different search term.`}
+            />
+          }
+        />
       </View>
     </WalletRequired>
   );

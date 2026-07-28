@@ -32,17 +32,17 @@ QR payloads carry a versioned payload schema including a key identifier (`kid`):
 
 ### Schema Fields
 
-| Field | Type | Description |
-| --- | --- | --- |
-| `type` | string | Constant identifier (`guildpass.access-check`). |
-| `version` | number | Canonical schema version (`1`). |
-| `guildId` | string | Unique guild ID. |
-| `resourceId` | string | Target resource or access gate ID. |
-| `walletAddress` | string (optional) | Holder wallet address (0x-prefixed hex). |
-| `expiresAt` | string (optional) | ISO-8601 UTC timestamp after which payload expires. |
-| `kid` | string (optional) | Key ID identifying which issuer public key signed the payload. |
-| `signature` | string (optional) | DER-encoded hex secp256k1 ECDSA signature over canonical message. |
-| `nonce` | string (optional) | Unique per-issuance identifier for replay protection. |
+| Field           | Type              | Description                                                       |
+| --------------- | ----------------- | ----------------------------------------------------------------- |
+| `type`          | string            | Constant identifier (`guildpass.access-check`).                   |
+| `version`       | number            | Canonical schema version (`1`).                                   |
+| `guildId`       | string            | Unique guild ID.                                                  |
+| `resourceId`    | string            | Target resource or access gate ID.                                |
+| `walletAddress` | string (optional) | Holder wallet address (0x-prefixed hex).                          |
+| `expiresAt`     | string (optional) | ISO-8601 UTC timestamp after which payload expires.               |
+| `kid`           | string (optional) | Key ID identifying which issuer public key signed the payload.    |
+| `signature`     | string (optional) | DER-encoded hex secp256k1 ECDSA signature over canonical message. |
+| `nonce`         | string (optional) | Unique per-issuance identifier for replay protection.             |
 
 ---
 
@@ -71,10 +71,10 @@ The client fetches the guild's key registry via `guildPassClient.guilds.getGuild
 ```typescript
 type GuildKeyRegistry = {
   guildId: string;
-  keys: Map<string, string>;       // Map of kid -> hex secp256k1 public key
-  revokedKids: Set<string>;        // Set of revoked key IDs
-  fetchedAt: number;              // Timestamp (ms) when fetched
-  legacyPublicKey?: string;        // Fallback static public key for legacy payloads
+  keys: Map<string, string>; // Map of kid -> hex secp256k1 public key
+  revokedKids: Set<string>; // Set of revoked key IDs
+  fetchedAt: number; // Timestamp (ms) when fetched
+  legacyPublicKey?: string; // Fallback static public key for legacy payloads
 };
 ```
 
@@ -101,6 +101,12 @@ To balance scanner performance, network efficiency, and security, key registries
 
 - **Bounded Cache TTL**: `15 minutes` (`15 * 60 * 1000 ms`).
 - **Offline Trust Window**: `24 hours` (`24 * 60 * 60 * 1000 ms`).
+
+### Persistent Cold-Start Cache
+
+After a successful online fetch, the client writes the serialized guild key registry to the existing SecureStore-backed sensitive storage under a per-guild key. The stored payload contains the active key list, revoked key IDs, optional legacy public key, `fetchedAt` timestamp, and a SHA-256 checksum over the canonical JSON payload. On a cold app start, `getGuildKeyRegistry()` reads this persisted copy before attempting the network. If the checksum, guild ID, schema version, or field shapes do not match, the entry is discarded and the verifier falls back to a fresh online fetch.
+
+The cache is tamper-evident against corruption or partial local writes and is stored in the platform keychain/keystore path already used for sensitive GuildPass state. It is not treated as a new authority: the 15-minute refresh TTL and 24-hour offline trust window still apply, and a registry beyond that window fails closed if it cannot be refreshed. A fully compromised device could alter both data and checksum, so the security boundary remains the authenticated, pinned GuildPass API plus the bounded offline trust window.
 
 ### Resolution & Refresh Workflow
 
@@ -159,7 +165,7 @@ When `appConfig.qrSignatureVerification` is enabled:
    - Look up `kid` in guild's `GuildKeyRegistry`.
 2. **Revocation Check**:
    - If `kid` exists in `registry.revokedKids`: **REJECT** immediately with code `QR_KEY_REVOKED`.
-   - *A payload signed with a revoked `kid` is rejected regardless of signature validity.*
+   - _A payload signed with a revoked `kid` is rejected regardless of signature validity._
 3. **Unknown Key Check**:
    - If `kid` is specified but absent from `registry.keys`: **REJECT** with code `QR_KEY_UNKNOWN`.
 4. **Rotation Overlap**:
@@ -207,10 +213,10 @@ When `appConfig.qrSignatureVerification` is enabled:
 
 ## 8. Source Code Map
 
-| Component | Path | Responsibility |
-| --- | --- | --- |
-| Signature Primitives | `src/features/access/qrSignature.ts` | ECDSA secp256k1 verification & canonical message builder |
-| Key Registry & Cache | `src/features/access/guildIssuerKey.ts` | Key fetch, rotation, revocation check, TTL & offline fallback |
-| Verification Pipeline | `src/features/access/verifyQrPayload.ts` | End-to-end QR parsing, key resolution, and signature check |
-| Schema Definition | `src/features/access/qrPayload.ts` | Structural payload parsing & `kid` validation |
-| Test Suite | `tests/qrKeyRotation.test.ts` | Comprehensive unit/integration coverage for key rotation |
+| Component             | Path                                     | Responsibility                                                |
+| --------------------- | ---------------------------------------- | ------------------------------------------------------------- |
+| Signature Primitives  | `src/features/access/qrSignature.ts`     | ECDSA secp256k1 verification & canonical message builder      |
+| Key Registry & Cache  | `src/features/access/guildIssuerKey.ts`  | Key fetch, rotation, revocation check, TTL & offline fallback |
+| Verification Pipeline | `src/features/access/verifyQrPayload.ts` | End-to-end QR parsing, key resolution, and signature check    |
+| Schema Definition     | `src/features/access/qrPayload.ts`       | Structural payload parsing & `kid` validation                 |
+| Test Suite            | `tests/qrKeyRotation.test.ts`            | Comprehensive unit/integration coverage for key rotation      |

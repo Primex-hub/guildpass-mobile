@@ -3,7 +3,7 @@ import { Platform } from "react-native";
 
 /**
  * KeyManager - Manages encryption key lifecycle for the encrypted offline cache
- * 
+ *
  * Responsibilities:
  * - Generate cryptographically secure 256-bit AES keys
  * - Store keys in expo-secure-store with device-bound access controls
@@ -39,11 +39,26 @@ export interface KeyInfo {
   needsRotation: boolean;
 }
 
+export interface KeyRotationContext {
+  /** The currently stored key, used to decrypt existing ciphertext. */
+  oldKey: string;
+  /** The candidate replacement key, used to re-encrypt existing ciphertext. */
+  newKey: string;
+}
+
+export interface KeyRotationOptions {
+  /**
+   * Re-encrypt persisted data before the stored key is overwritten.
+   * If this callback fails, rotation is deferred and the old key remains active.
+   */
+  reencrypt?: (context: KeyRotationContext) => Promise<void>;
+}
+
 export class KeyManagerError extends Error {
   constructor(
     message: string,
     public readonly code: KeyManagerErrorCode,
-    public readonly originalError?: unknown
+    public readonly originalError?: unknown,
   ) {
     super(message);
     this.name = "KeyManagerError";
@@ -92,10 +107,11 @@ export class KeyManager {
       if (!existingKey) {
         await this.generateAndStoreKey();
       } else {
-        // Check if key needs rotation
+        // Check if key needs rotation. Actual rotation is coordinated by
+        // EncryptedPersister so existing encrypted cache can be migrated first.
         const keyInfo = await this.getKeyInfo();
         if (keyInfo?.needsRotation) {
-          await this.rotateKey();
+          console.warn("[KeyManager] Key rotation deferred until encrypted cache migration");
         }
       }
     } catch (error) {
@@ -112,7 +128,7 @@ export class KeyManager {
   private generateKey(): string {
     // Generate 32 random bytes (256 bits)
     const keyBytes = new Uint8Array(32);
-    
+
     // Use crypto.getRandomValues for cryptographically secure random generation
     // This is available in React Native's JavaScript environment
     if (typeof crypto !== "undefined" && crypto.getRandomValues) {
@@ -128,7 +144,7 @@ export class KeyManager {
 
     // Convert to hex string
     return Array.from(keyBytes)
-      .map(byte => byte.toString(16).padStart(2, "0"))
+      .map((byte) => byte.toString(16).padStart(2, "0"))
       .join("");
   }
 
@@ -140,7 +156,7 @@ export class KeyManager {
     if (!(await this.isSecureStoreAvailable())) {
       throw new KeyManagerError(
         "Secure store is not available on this device",
-        KeyManagerErrorCode.SECURE_STORE_UNAVAILABLE
+        KeyManagerErrorCode.SECURE_STORE_UNAVAILABLE,
       );
     }
 
@@ -151,14 +167,10 @@ export class KeyManager {
     const storeWithRetry = async (attempt: number): Promise<void> => {
       try {
         await SecureStore.setItemAsync(this.keyId, key, options);
-        
+
         // Store the timestamp for key rotation tracking
         const timestamp = Date.now().toString();
-        await SecureStore.setItemAsync(
-          `${this.keyId}_timestamp`,
-          timestamp,
-          options
-        );
+        await SecureStore.setItemAsync(`${this.keyId}_timestamp`, timestamp, options);
       } catch (error) {
         if (attempt < this.maxRetries) {
           // Exponential backoff before retry
@@ -169,7 +181,7 @@ export class KeyManager {
         throw new KeyManagerError(
           `Failed to store encryption key after ${this.maxRetries} attempts`,
           KeyManagerErrorCode.STORAGE_FAILED,
-          error
+          error,
         );
       }
     };
@@ -189,7 +201,7 @@ export class KeyManager {
       }
       throw new KeyManagerError(
         "Secure store is not available on this device",
-        KeyManagerErrorCode.SECURE_STORE_UNAVAILABLE
+        KeyManagerErrorCode.SECURE_STORE_UNAVAILABLE,
       );
     }
 
@@ -197,7 +209,7 @@ export class KeyManager {
       // Race between retrieval and timeout
       const key = await this.withTimeout(
         SecureStore.getItemAsync(this.keyId),
-        this.retrievalTimeoutMs
+        this.retrievalTimeoutMs,
       );
 
       if (key) {
@@ -205,7 +217,7 @@ export class KeyManager {
         if (!this.isValidKeyFormat(key)) {
           throw new KeyManagerError(
             "Stored key has invalid format",
-            KeyManagerErrorCode.INVALID_KEY_FORMAT
+            KeyManagerErrorCode.INVALID_KEY_FORMAT,
           );
         }
         return key;
@@ -220,7 +232,7 @@ export class KeyManager {
       // If timeout occurred, switch to in-memory only mode
       if (error instanceof Error && error.message === "Timeout") {
         console.warn("[KeyManager] Key retrieval timed out, switching to in-memory mode");
-        
+
         // If we have a memory fallback key, use it
         if (this.memoryFallbackKey) {
           return this.memoryFallbackKey;
@@ -228,14 +240,14 @@ export class KeyManager {
 
         throw new KeyManagerError(
           `Key retrieval timed out after ${this.retrievalTimeoutMs}ms`,
-          KeyManagerErrorCode.RETRIEVAL_TIMEOUT
+          KeyManagerErrorCode.RETRIEVAL_TIMEOUT,
         );
       }
 
       throw new KeyManagerError(
         "Failed to retrieve encryption key",
         KeyManagerErrorCode.RETRIEVAL_FAILED,
-        error
+        error,
       );
     }
   }
@@ -253,7 +265,7 @@ export class KeyManager {
     try {
       const timestampStr = await this.withTimeout(
         SecureStore.getItemAsync(`${this.keyId}_timestamp`),
-        this.retrievalTimeoutMs
+        this.retrievalTimeoutMs,
       );
       if (timestampStr) {
         createdAt = parseInt(timestampStr, 10);
@@ -278,10 +290,10 @@ export class KeyManager {
   private async generateAndStoreKey(): Promise<string> {
     const key = this.generateKey();
     await this.storeKey(key);
-    
+
     // Store in memory as fallback
     this.memoryFallbackKey = key;
-    
+
     return key;
   }
 
@@ -289,13 +301,28 @@ export class KeyManager {
    * Rotate the encryption key (generate a new one)
    * This should be called when the key is due for rotation
    */
-  async rotateKey(): Promise<string> {
-    // Generate and store new key
-    const newKey = await this.generateAndStoreKey();
-    
-    // Note: Old encrypted data should be re-encrypted with the new key
-    // This is handled by the EncryptedPersister during migration
-    
+  async rotateKey(options: KeyRotationOptions = {}): Promise<string> {
+    const oldKey = await this.getKey();
+    const newKey = this.generateKey();
+
+    if (oldKey && options.reencrypt) {
+      try {
+        await options.reencrypt({ oldKey, newKey });
+      } catch (error) {
+        console.warn(
+          "[KeyManager] Key rotation deferred because cache re-encryption failed:",
+          error instanceof Error ? error.message : String(error),
+        );
+        return oldKey;
+      }
+    } else if (oldKey) {
+      console.warn("[KeyManager] Key rotation deferred because no re-encryption callback was provided");
+      return oldKey;
+    }
+
+    await this.storeKey(newKey);
+    this.memoryFallbackKey = newKey;
+
     console.log("[KeyManager] Key rotated successfully");
     return newKey;
   }

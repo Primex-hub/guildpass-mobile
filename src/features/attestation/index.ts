@@ -1,24 +1,27 @@
 /**
  * GuildPass Role Attestation Module
  *
- * Provides cryptographically verifiable, user-portable proofs of role membership
- * using EIP-712 signed attestations. Enables offline verification without backend dependency.
+ * Provides cryptographically verifiable proofs of role membership using EIP-712
+ * signed attestations. Existing attestations can be verified independently and
+ * offline while the required local data remains available; this module does not
+ * provide automatic cross-device recovery.
  *
  * @module features/attestation
  */
 
 // Types
-export * from './types';
+export * from "./types";
 
 // Core verification
-export * from './verifySignature';
+export * from "./verifySignature";
 
 // Storage layers
-export * from './attestationStorage';
-export * from './issuerKeyRegistry';
+export * from "./attestationStorage";
+export * from "./issuerKeyRegistry";
 
 // Service
-export { AttestationService, type AttestationServiceConfig } from './attestationService';
+export { AttestationService } from "./attestationService";
+export type { AttestationServiceConfig } from "./attestationService";
 
 // React hooks
-export * from './useAttestations';
+export * from "./useAttestations";

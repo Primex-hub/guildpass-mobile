@@ -1,14 +1,16 @@
 import { describe, it, expect } from "vitest";
-import { parseAccessQrPayload, ACCESS_QR_TYPE, ACCESS_QR_VERSION } from "./qrPayload";
+import { parseAccessQrPayload, ACCESS_QR_TYPE, ACCESS_QR_VERSION, QrPayloadError } from "./qrPayload";
 
 describe("parseAccessQrPayload edge cases", () => {
   const basePayload = {
     type: ACCESS_QR_TYPE,
-    version: ACCESS_QR_VERSION,
+    version: 2,
     guildId: "guild-123",
     resourceId: "resource-abc",
-    walletAddress: "0x1234567890123456789012345678901234567890",
+    walletAddress: "0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed",
     expiresAt: "2026-07-20T00:00:00.000Z",
+    kid: "key_1",
+    signature: "3045022100e...",
   };
 
   const mockNow = new Date("2026-07-19T00:00:00.000Z");
@@ -25,7 +27,12 @@ describe("parseAccessQrPayload edge cases", () => {
       expectedError: "QR code payload type is not supported.",
     },
     {
-      name: "Unsupported version",
+      name: "Unsupported version (legacy V1 rejected)",
+      input: JSON.stringify({ ...basePayload, version: 1 }),
+      expectedError: "QR code payload version is not supported.",
+    },
+    {
+      name: "Unsupported version (future version rejected)",
       input: JSON.stringify({ ...basePayload, version: "999.0.0" }),
       expectedError: "QR code payload version is not supported.",
     },
@@ -38,6 +45,16 @@ describe("parseAccessQrPayload edge cases", () => {
       name: "Missing required fields (resourceId)",
       input: JSON.stringify({ ...basePayload, resourceId: "   " }),
       expectedError: "QR code is missing a valid resource ID.",
+    },
+    {
+      name: "Missing required fields (kid)",
+      input: JSON.stringify({ ...basePayload, kid: undefined }),
+      expectedError: "QR code contains an invalid or missing key ID.",
+    },
+    {
+      name: "Missing required fields (signature)",
+      input: JSON.stringify({ ...basePayload, signature: undefined }),
+      expectedError: "QR code contains an invalid or missing signature.",
     },
     {
       name: "Invalid wallet address pattern",
@@ -63,8 +80,9 @@ describe("parseAccessQrPayload edge cases", () => {
     expect(result).toEqual({
       guildId: "guild-123",
       resourceId: "resource-abc",
-      walletAddress: "0x1234567890123456789012345678901234567890",
+      walletAddress: "0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed",
       expiresAt: "2026-07-20T00:00:00.000Z",
+      kid: "key_1",
     });
   });
 

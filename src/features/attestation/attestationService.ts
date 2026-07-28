@@ -3,19 +3,26 @@
  * Orchestrates attestation fetching, verification, caching and local verification
  */
 
-import { type RoleAttestation, type GuildIssuerKey, type AttestationValidationResult } from './types';
-import { validateAttestation, getAttestationValidityStatus } from './verifySignature';
+import type { RoleAttestation, GuildIssuerKey, AttestationValidationResult } from "./types";
+import { validateAttestation, getAttestationValidityStatus } from "./verifySignature";
 import {
   getCachedIssuerKey,
   cacheIssuerKey,
   invalidateIssuerKeyCache,
-} from './issuerKeyRegistry';
+  cacheAttestationRevocationRegistry,
+} from "./issuerKeyRegistry";
 import {
   cacheAttestation,
   getCachedAttestation,
   removeCachedAttestation,
   getAttestationsForGuild,
-} from './attestationStorage';
+} from "./attestationStorage";
+
+/**
+ * Callback for fetching revocation registry from the backend.
+ * Returns the set of revoked issuer addresses (0x-prefixed hex) for the guild.
+ */
+export type FetchRevocationRegistry = (guildId: string) => Promise<string[]>;
 
 /**
  * Attestation service configuration
@@ -30,6 +37,16 @@ export interface AttestationServiceConfig {
     guildId: string;
     roleId: string;
   }) => Promise<RoleAttestation>;
+  /**
+   * Optional callback to fetch the set of revoked issuer addresses for a guild.
+   * When provided, the service populates the revocation cache during online
+   * verification, enabling offline revocation checks later.
+   *
+   * If omitted, revocation data must be seeded via
+   * `cacheAttestationRevocationRegistry()` externally, or else
+   * `validateAttestation()` will fail closed (rejecting unverifiable attestations).
+   */
+  fetchRevocationRegistry?: FetchRevocationRegistry;
 }
 
 /**
@@ -43,11 +60,13 @@ export class AttestationService {
     guildId: string;
     roleId: string;
   }) => Promise<RoleAttestation>;
+  private fetchRevocationRegistry?: FetchRevocationRegistry;
 
   constructor(config: AttestationServiceConfig) {
     this.chainId = config.chainId;
     this.fetchIssuerKey = config.fetchIssuerKey;
     this.fetchAttestation = config.fetchAttestation;
+    this.fetchRevocationRegistry = config.fetchRevocationRegistry;
   }
 
   /**
@@ -62,7 +81,7 @@ export class AttestationService {
   async fetchAndVerifyAttestation(
     walletAddress: string,
     guildId: string,
-    roleId: string
+    roleId: string,
   ): Promise<{
     valid: boolean;
     attestation?: RoleAttestation;
@@ -80,12 +99,11 @@ export class AttestationService {
       // Get issuer key (cached or fresh)
       const issuerAddress = await this.getIssuerKey(guildId);
 
+      // Populate revocation cache if a fetch callback is configured
+      await this.maybeRefreshRevocationCache(guildId);
+
       // Verify the attestation
-      const validationResult = await validateAttestation(
-        attestation,
-        issuerAddress,
-        this.chainId
-      );
+      const validationResult = await validateAttestation(attestation, issuerAddress, this.chainId);
 
       if (!validationResult.valid) {
         return {
@@ -105,7 +123,7 @@ export class AttestationService {
     } catch (error) {
       return {
         valid: false,
-        error: error instanceof Error ? error.message : 'Unknown error fetching attestation',
+        error: error instanceof Error ? error.message : "Unknown error fetching attestation",
       };
     }
   }
@@ -122,7 +140,7 @@ export class AttestationService {
   async verifyLocalAttestation(
     walletAddress: string,
     guildId: string,
-    roleId: string
+    roleId: string,
   ): Promise<AttestationValidationResult> {
     try {
       // Get cached attestation
@@ -131,7 +149,7 @@ export class AttestationService {
       if (!cached) {
         return {
           valid: false,
-          reason: 'No cached attestation found',
+          reason: "No cached attestation found",
         };
       }
 
@@ -141,23 +159,46 @@ export class AttestationService {
       if (!issuerKey) {
         return {
           valid: false,
-          reason: 'Issuer key not cached - requires online fetch',
+          reason: "Issuer key not cached - requires online fetch",
         };
       }
 
       // Verify the cached attestation
-      const result = await validateAttestation(
-        cached,
-        issuerKey.issuerAddress,
-        this.chainId
-      );
+      const result = await validateAttestation(cached, issuerKey.issuerAddress, this.chainId);
 
       return result;
     } catch (error) {
       return {
         valid: false,
-        reason: error instanceof Error ? error.message : 'Verification failed',
+        reason: error instanceof Error ? error.message : "Verification failed",
       };
+    }
+  }
+
+  /**
+   * Optionally refresh the revocation cache from the backend.
+   * No-op if no fetchRevocationRegistry callback is configured.
+   * This is called during online verification so that offline checks
+   * have recent revocation data within the trust window.
+   */
+  private async maybeRefreshRevocationCache(guildId: string): Promise<void> {
+    if (!this.fetchRevocationRegistry) {
+      return;
+    }
+
+    try {
+      const revokedAddresses = await this.fetchRevocationRegistry(guildId);
+      if (Array.isArray(revokedAddresses)) {
+        await cacheAttestationRevocationRegistry(
+          guildId,
+          new Set(revokedAddresses.map((a) => a.toLowerCase())),
+        );
+      }
+    } catch (error) {
+      // Non-fatal: revocation data is best-effort during online fetch.
+      // If the fetch fails, existing cached data (if any) will be used
+      // for the trust-window check, or the next validation will fail closed.
+      console.warn(`Failed to refresh revocation registry for guild ${guildId}:`, error);
     }
   }
 
@@ -203,7 +244,7 @@ export class AttestationService {
   async hasCachedAttestation(
     walletAddress: string,
     guildId: string,
-    roleId: string
+    roleId: string,
   ): Promise<boolean> {
     const cached = await getCachedAttestation(walletAddress, guildId, roleId);
 
@@ -218,11 +259,7 @@ export class AttestationService {
       return false;
     }
 
-    const result = await validateAttestation(
-      cached,
-      issuerKey.issuerAddress,
-      this.chainId
-    );
+    const result = await validateAttestation(cached, issuerKey.issuerAddress, this.chainId);
 
     return result.valid;
   }
@@ -236,7 +273,7 @@ export class AttestationService {
    */
   async getCachedAttestationsForGuild(
     walletAddress: string,
-    guildId: string
+    guildId: string,
   ): Promise<RoleAttestation[]> {
     const attestations = await getAttestationsForGuild(walletAddress, guildId);
     const issuerKey = await getCachedIssuerKey(guildId);
@@ -248,11 +285,7 @@ export class AttestationService {
     const valid: RoleAttestation[] = [];
 
     for (const attestation of attestations) {
-      const result = await validateAttestation(
-        attestation,
-        issuerKey.issuerAddress,
-        this.chainId
-      );
+      const result = await validateAttestation(attestation, issuerKey.issuerAddress, this.chainId);
 
       if (result.valid) {
         valid.push(attestation);

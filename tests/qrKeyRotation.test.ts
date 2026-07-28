@@ -26,6 +26,19 @@ import {
 
 const { mockGetGuildConfig } = vi.hoisted(() => ({ mockGetGuildConfig: vi.fn() }));
 const flagState = vi.hoisted(() => ({ qrSignatureVerification: true }));
+const storageState = vi.hoisted(() => {
+  const items = new Map<string, string>();
+  return {
+    items,
+    getItem: vi.fn(async (name: string) => items.get(name) ?? null),
+    setItem: vi.fn(async (name: string, value: string) => {
+      items.set(name, value);
+    }),
+    removeItem: vi.fn(async (name: string) => {
+      items.delete(name);
+    }),
+  };
+});
 
 vi.mock("../src/lib/guildpassClient", () => ({
   guildPassClient: {
@@ -35,6 +48,14 @@ vi.mock("../src/lib/guildpassClient", () => ({
 
 vi.mock("../src/config/appConfig", () => ({
   appConfig: flagState,
+}));
+
+vi.mock("../src/lib/storage", () => ({
+  migratingSecureStorage: {
+    getItem: storageState.getItem,
+    setItem: storageState.setItem,
+    removeItem: storageState.removeItem,
+  },
 }));
 
 const now = new Date("2026-07-20T12:00:00.000Z");
@@ -51,6 +72,7 @@ describe("QR Key Rotation & Revocation Protocol", () => {
     clearIssuerKeyCache();
     clearNonceCache();
     resetKeyRegistryTimeouts();
+    storageState.items.clear();
     mockGetGuildConfig.mockReset();
     flagState.qrSignatureVerification = true;
   });
@@ -78,10 +100,10 @@ describe("QR Key Rotation & Revocation Protocol", () => {
       );
 
       const parsed1 = await verifyAndParseAccessQrPayload(payloadV1, now);
-      expect(parsed1.kid).toBe("key-v1");
+      expect(parsed1.payload.kid).toBe("key-v1");
 
       const parsed2 = await verifyAndParseAccessQrPayload(payloadV2, now);
-      expect(parsed2.kid).toBe("key-v2");
+      expect(parsed2.payload.kid).toBe("key-v2");
     });
 
     it("supports issuerKeys as an array of key entries", async () => {
@@ -99,7 +121,7 @@ describe("QR Key Rotation & Revocation Protocol", () => {
       );
 
       const parsed = await verifyAndParseAccessQrPayload(payloadV2, now);
-      expect(parsed.kid).toBe("key-v2");
+      expect(parsed.payload.kid).toBe("key-v2");
     });
   });
 
@@ -117,9 +139,9 @@ describe("QR Key Rotation & Revocation Protocol", () => {
       const revokedFields = { ...validFields, kid: "key-revoked-99" };
       const revokedPayload = buildSignedQrPayloadString(revokedFields, TEST_REVOKED_PRIVATE_KEY);
 
-      await expect(verifyAndParseAccessQrPayload(revokedPayload, now)).rejects.toMatchObject({
-        code: QR_SIGNATURE_ERROR_CODES.REVOKED_KEY,
-      });
+      await expect(verifyAndParseAccessQrPayload(revokedPayload, now)).rejects.toThrow(
+        expect.objectContaining({ code: QR_SIGNATURE_ERROR_CODES.REVOKED_KEY })
+      );
     });
 
     it("rejects a revoked kid when marked as status 'revoked' in issuerKeys array", async () => {
@@ -136,9 +158,9 @@ describe("QR Key Rotation & Revocation Protocol", () => {
         TEST_REVOKED_PRIVATE_KEY,
       );
 
-      await expect(verifyAndParseAccessQrPayload(payload, now)).rejects.toMatchObject({
-        code: QR_SIGNATURE_ERROR_CODES.REVOKED_KEY,
-      });
+      await expect(verifyAndParseAccessQrPayload(payload, now)).rejects.toThrow(
+        expect.objectContaining({ code: QR_SIGNATURE_ERROR_CODES.REVOKED_KEY })
+      );
     });
   });
 
@@ -156,24 +178,25 @@ describe("QR Key Rotation & Revocation Protocol", () => {
         TEST_ISSUER_PRIVATE_KEY,
       );
 
-      await expect(verifyAndParseAccessQrPayload(unknownPayload, now)).rejects.toMatchObject({
-        code: QR_SIGNATURE_ERROR_CODES.UNKNOWN_KEY,
-      });
+      await expect(verifyAndParseAccessQrPayload(unknownPayload, now)).rejects.toThrow(
+        expect.objectContaining({ code: QR_SIGNATURE_ERROR_CODES.UNKNOWN_KEY })
+      );
     });
 
     it("rejects payload with invalid non-string kid format at structural layer", async () => {
       const malformedKidPayload = JSON.stringify({
         type: "guildpass.access-check",
-        version: 1,
+        version: 2,
         guildId: "guild_abc",
         resourceId: "vip-door",
         expiresAt: "2026-07-20T12:05:00.000Z",
+        signature: "304402204f4c2f9a1b3c5d6e7f8091a2b3c4d5e6f70819a2b3c4d5e6f70819a2b3c4d5e6022033445566778899aabbccddeeff00112233445566778899aabbccddeeff001122",
         kid: "", // empty kid string
       });
 
-      await expect(verifyAndParseAccessQrPayload(malformedKidPayload, now)).rejects.toMatchObject({
-        code: QR_PAYLOAD_ERROR_CODES.INVALID_KID,
-      });
+      await expect(verifyAndParseAccessQrPayload(malformedKidPayload, now)).rejects.toThrow(
+        expect.objectContaining({ code: QR_PAYLOAD_ERROR_CODES.INVALID_KID })
+      );
     });
   });
 
@@ -290,6 +313,57 @@ describe("QR Key Rotation & Revocation Protocol", () => {
       });
     });
 
+    it("loads a persisted registry after a simulated restart and uses it while offline", async () => {
+      mockGetGuildConfig.mockResolvedValueOnce({
+        guildId: "guild_abc",
+        issuerKeys: { "key-v1": TEST_ISSUER_PUBLIC_KEY },
+      });
+
+      setKeyRegistryCacheTtlMs(15 * 60 * 1000);
+      setKeyRegistryOfflineTrustWindowMs(24 * 60 * 60 * 1000);
+
+      const t0 = new Date("2026-07-20T12:00:00.000Z");
+      await getGuildIssuerPublicKey("guild_abc", "key-v1", t0);
+
+      clearIssuerKeyCache(); // Simulates an app restart while SecureStore survives.
+      mockGetGuildConfig.mockRejectedValueOnce(new Error("Network Error / Offline"));
+
+      const tAfterRestart = new Date("2026-07-20T13:00:00.000Z");
+      const key = await getGuildIssuerPublicKey("guild_abc", "key-v1", tAfterRestart);
+
+      expect(key).toBe(TEST_ISSUER_PUBLIC_KEY);
+      expect(storageState.setItem).toHaveBeenCalledWith(
+        "guildpass:access-key-registry:v1:guild_abc",
+        expect.stringContaining('"checksum"'),
+      );
+      expect(mockGetGuildConfig).toHaveBeenCalledTimes(2);
+    });
+
+    it("ignores tampered persisted registries and fetches a fresh copy", async () => {
+      storageState.items.set(
+        "guildpass:access-key-registry:v1:guild_abc",
+        JSON.stringify({
+          version: 1,
+          guildId: "guild_abc",
+          keys: [["key-v1", TEST_REVOKED_PUBLIC_KEY]],
+          revokedKids: [],
+          fetchedAt: now.getTime(),
+          checksum: "0xinvalid",
+        }),
+      );
+      mockGetGuildConfig.mockResolvedValueOnce({
+        guildId: "guild_abc",
+        issuerKeys: { "key-v1": TEST_ISSUER_PUBLIC_KEY },
+      });
+
+      const key = await getGuildIssuerPublicKey("guild_abc", "key-v1", now);
+
+      expect(key).toBe(TEST_ISSUER_PUBLIC_KEY);
+      expect(storageState.removeItem).toHaveBeenCalledWith(
+        "guildpass:access-key-registry:v1:guild_abc",
+      );
+    });
+
     it("does not silently accept unverifiable payloads when no cache exists and offline", async () => {
       mockGetGuildConfig.mockRejectedValueOnce(new Error("Network Error / Offline"));
 
@@ -298,9 +372,9 @@ describe("QR Key Rotation & Revocation Protocol", () => {
         TEST_ISSUER_PRIVATE_KEY,
       );
 
-      await expect(verifyAndParseAccessQrPayload(payload, now)).rejects.toMatchObject({
-        code: QR_SIGNATURE_ERROR_CODES.PUBLIC_KEY_UNAVAILABLE,
-      });
+      await expect(verifyAndParseAccessQrPayload(payload, now)).rejects.toThrow(
+        expect.objectContaining({ code: QR_SIGNATURE_ERROR_CODES.PUBLIC_KEY_UNAVAILABLE })
+      );
     });
   });
 });

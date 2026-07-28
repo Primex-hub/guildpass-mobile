@@ -1,5 +1,5 @@
 import { create } from "zustand";
-import type { AccessCheckParams, AccessCheckResult } from "./useAccessCheck";
+import type { AccessCheckResult } from "./useAccessCheck";
 
 export const MAX_ACCESS_HISTORY_ENTRIES = 20;
 
@@ -8,7 +8,7 @@ export type AccessHistoryStatus = "granted" | "denied" | "error";
 export type AccessHistoryEntry = {
   id: string;
   guildId: string;
-  guildName: string;
+  guildName?: string;
   resourceId: string;
   resourceName: string;
   status: AccessHistoryStatus;
@@ -18,8 +18,10 @@ export type AccessHistoryEntry = {
   requiredRoles: string[];
 };
 
-export type RecordCheckInput = Pick<AccessCheckParams, "guildId" | "resourceId"> & {
+type RecordCheckInput = {
+  guildId: string;
   guildName?: string;
+  resourceId: string;
   resourceName?: string;
   result?: AccessCheckResult;
   error?: unknown;
@@ -39,7 +41,7 @@ let entrySequence = 0;
 export const useAccessHistoryStore = create<AccessHistoryState>((set, get) => ({
   entries: [],
 
-  recordCheck: ({ guildId, resourceId, guildName, resourceName, result }) => {
+  recordCheck: ({ guildId, guildName, resourceId, resourceName, result }) => {
     const checkedAt = new Date().toISOString();
     const status = result ? (result.hasAccess ? "granted" : "denied") : "error";
 

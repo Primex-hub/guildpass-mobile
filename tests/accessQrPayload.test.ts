@@ -17,6 +17,9 @@ const buildPayload = (overrides = {}) =>
     guildId: "guild_abc",
     resourceId: "vip-door",
     expiresAt: "2026-06-23T12:05:00.000Z",
+    kid: "test-kid",
+    signature: "fake-signature",
+    nonce: "fake-nonce",
     ...overrides,
   });
 
@@ -25,7 +28,7 @@ describe("SUPPORTED_QR_PAYLOAD_VERSIONS", () => {
     expect(SUPPORTED_QR_PAYLOAD_VERSIONS).toEqual([
       {
         type: "guildpass.access-check",
-        version: 1,
+        version: 2,
       },
     ]);
   });
@@ -45,6 +48,8 @@ describe("parseAccessQrPayload", () => {
       resourceId: "vip-door",
       walletAddress: "0x1234567890123456789012345678901234567890",
       expiresAt: "2026-06-23T12:05:00.000Z",
+      kid: "test-kid",
+      nonce: "fake-nonce",
     });
   });
 
@@ -86,7 +91,7 @@ describe("parseAccessQrPayload", () => {
 
   it("rejects unsupported payload versions with QR_PAYLOAD_UNSUPPORTED_VERSION code and update suggestion", () => {
     try {
-      parseAccessQrPayload(buildPayload({ version: 2 }), now);
+      parseAccessQrPayload(buildPayload({ version: 1 }), now);
       expect.fail("Should have thrown QrPayloadError");
     } catch (e) {
       expect(e).toBeInstanceOf(QrPayloadError);
@@ -97,9 +102,9 @@ describe("parseAccessQrPayload", () => {
     }
   });
 
-  it("distinguishes version: 2 from unknown type values by error code", () => {
+  it("distinguishes version: 1 from unknown type values by error code", () => {
     try {
-      parseAccessQrPayload(buildPayload({ version: 2 }), now);
+      parseAccessQrPayload(buildPayload({ version: 1 }), now);
       expect.fail("Should have thrown");
     } catch (e) {
       expect((e as QrPayloadError).code).toBe(QR_PAYLOAD_ERROR_CODES.UNSUPPORTED_VERSION);
@@ -113,7 +118,7 @@ describe("parseAccessQrPayload", () => {
     }
 
     try {
-      parseAccessQrPayload(buildPayload({ type: "unknown.type", version: 2 }), now);
+      parseAccessQrPayload(buildPayload({ type: "unknown.type", version: 1 }), now);
       expect.fail("Should have thrown");
     } catch (e) {
       expect((e as QrPayloadError).code).toBe(QR_PAYLOAD_ERROR_CODES.UNSUPPORTED_TYPE);
@@ -139,6 +144,8 @@ describe("parseAccessQrPayload", () => {
       guildId: "guild_abc",
       resourceId: "vip-door",
       expiresAt: "2026-06-23T12:05:00.000Z",
+      kid: "test-kid",
+      nonce: "fake-nonce",
     });
   });
 
@@ -146,5 +153,47 @@ describe("parseAccessQrPayload", () => {
     expect(() => parseAccessQrPayload(buildPayload({ walletAddress: "0x123" }), now)).toThrow(
       "QR code contains an invalid wallet address.",
     );
+  });
+});
+
+describe("parseAccessQrPayload - Delimiter Injection Prevention (Property-based tests)", () => {
+  it("rejects randomly generated colliding payloads", () => {
+    // A lightweight custom generator for delimiter injection fuzzing
+    const generateCollidingPayloads = (numPairs: number) => {
+      const payloads = [];
+      const safeChars = "abcdefghijklmnopqrstuvwxyz0123456789";
+      for (let i = 0; i < numPairs; i++) {
+        // e.g. guild="foo", resource="bar\nbaz" -> canonicalizes to foo\nbar\nbaz
+        // collides with guild="foo\nbar", resource="baz" -> canonicalizes to foo\nbar\nbaz
+        const p1 = `part1_${Math.random()}`;
+        const p2 = `part2_${Math.random()}`;
+        const p3 = `part3_${Math.random()}`;
+        
+        payloads.push({
+          guildId: p1,
+          resourceId: `${p2}\n${p3}`,
+        });
+        payloads.push({
+          guildId: `${p1}\n${p2}`,
+          resourceId: p3,
+        });
+      }
+      return payloads;
+    };
+
+    const maliciousPayloads = generateCollidingPayloads(50);
+    let rejectedCount = 0;
+
+    for (const fields of maliciousPayloads) {
+      try {
+        parseAccessQrPayload(buildPayload(fields), now);
+      } catch (e) {
+        expect(e).toBeInstanceOf(QrPayloadError);
+        rejectedCount++;
+      }
+    }
+
+    // Ensure EVERY generated attempt with \n was rejected
+    expect(rejectedCount).toBe(maliciousPayloads.length);
   });
 });
